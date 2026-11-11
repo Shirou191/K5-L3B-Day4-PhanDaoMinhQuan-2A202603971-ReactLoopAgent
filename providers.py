@@ -1,27 +1,54 @@
-"""Bốn provider cùng một interface. Không chứa agent loop."""
+"""Các provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
+
+# Retry chỉ cho lỗi hạ tầng tạm thời; có trần số lần và trần tổng thời gian chờ.
+RETRY_CODES = (429, 500, 502, 503, 504)
+RETRY_ATTEMPTS = 5
+RETRY_BUDGET_SECONDS = 150
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
+    # Groq dùng endpoint tương thích OpenAI nên chung nhánh Chat Completions.
+    'groq': ('GROQ_API_KEY', 'https://api.groq.com/openai/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+def _retry_delay(exc, attempt):
+    """Chờ theo Retry-After nếu provider cung cấp, nếu không thì backoff 2^attempt."""
+    header = (exc.headers or {}).get('Retry-After') if hasattr(exc, 'headers') else None
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+        return max(1.0, min(float(header), 60.0))
+    except (TypeError, ValueError):
+        return min(2.0 ** attempt, 32.0)
+
+
+def post_json(url, headers, payload):
+    # Một số provider đứng sau WAF chặn User-Agent mặc định của urllib (HTTP 403).
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers={'Content-Type': 'application/json',
+                                          'User-Agent': 'StatusAgentLab/1.0', **headers})
+    waited = 0.0
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Do not print response bodies: they may contain account or request data.
+            delay = _retry_delay(exc, attempt)
+            # Rate limit hoặc lỗi 5xx tạm thời: chờ rồi thử lại trong budget.
+            if exc.code not in RETRY_CODES or attempt == RETRY_ATTEMPTS or waited + delay > RETRY_BUDGET_SECONDS:
+                raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+            time.sleep(delay)
+            waited += delay
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -73,7 +100,12 @@ class Provider:
                 else:
                     native.append({'role': 'user', 'content': [block]})
             else:
-                native.append({'role': 'user', 'content': m['content']})
+                # Anthropic không nhận hai lượt user liền nhau: gộp message user chèn
+                # thêm (ví dụ notice của agent) vào lượt user đang mở.
+                if native and native[-1]['role'] == 'user' and isinstance(native[-1]['content'], list):
+                    native[-1]['content'].append({'type': 'text', 'text': m['content']})
+                else:
+                    native.append({'role': 'user', 'content': m['content']})
         tools = [{'name': x['function']['name'], 'description': x['function']['description'], 'input_schema': x['function']['parameters']} for x in schemas]
         payload = {'model': self.model, 'max_tokens': 1024, 'system': system, 'messages': native}
         if tools:
