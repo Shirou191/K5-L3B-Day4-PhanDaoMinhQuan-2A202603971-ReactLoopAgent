@@ -1,14 +1,21 @@
 """Các provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
 
 # Retry chỉ cho lỗi hạ tầng tạm thời; có trần số lần và trần tổng thời gian chờ.
 RETRY_CODES = (429, 500, 502, 503, 504)
-RETRY_ATTEMPTS = 5
-RETRY_BUDGET_SECONDS = 150
+RETRY_ATTEMPTS = 8
+# Provider free tier có thể giới hạn token/phút rất chặt (ví dụ Groq: 8000 TPM), nên
+# một call có thể phải chờ vài chục giây. Trần tổng thời gian chờ vẫn là trần cứng.
+RETRY_BUDGET_SECONDS = 600
+# Provider xin chờ lâu hơn mức này thì không còn là blip tạm thời (ví dụ hết quota
+# ngày): thử lại chỉ tốn thời gian. Fail ngay và nói rõ quota nào, hơn là nghiền
+# RETRY_ATTEMPTS lượt trong 7 phút rồi vẫn fail.
+RETRY_MAX_SINGLE_WAIT = 90.0
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
@@ -20,13 +27,90 @@ CONFIG = {
 }
 
 
-def _retry_delay(exc, attempt):
-    """Chờ theo Retry-After nếu provider cung cấp, nếu không thì backoff 2^attempt."""
-    header = (exc.headers or {}).get('Retry-After') if hasattr(exc, 'headers') else None
+# 429 có nhiều nguyên nhân khác nhau (hết token/phút vs hết token/ngày) và cách xử lý
+# ngược nhau: một cái chờ là xong, một cái chờ vô ích. Chỉ lấy loại quota + header số.
+LIMIT_LABELS = (
+    ('tokens per day', 'token/ngày (TPD) - chờ không hết, phải sang ngày mới'),
+    ('tokens per minute', 'token/phút (TPM) - chờ là hết'),
+    ('requests per day', 'request/ngày (RPD) - chờ không hết'),
+    ('requests per minute', 'request/phút (RPM) - chờ là hết'),
+)
+
+
+def _limit_hint(exc):
+    """Mô tả quota bị chạm. Không đưa body vào message: body chứa org id, request id."""
+    parts = []
+    headers = getattr(exc, 'headers', None) or {}
+    for name in ('x-ratelimit-limit-tokens', 'x-ratelimit-remaining-tokens',
+                 'x-ratelimit-reset-tokens', 'retry-after'):
+        value = headers.get(name)
+        if value:
+            parts.append(f'{name}={value}')
     try:
-        return max(1.0, min(float(header), 60.0))
+        message = json.loads(exc.read().decode()).get('error', {}).get('message', '')
+    except Exception:
+        message = ''
+    for needle, label in LIMIT_LABELS:
+        if needle in message.lower():
+            parts.append(f'quota: {label}')
+            break
+    return f" ({'; '.join(parts)})" if parts else ''
+
+
+_DURATION_UNITS = {'ms': 0.001, 's': 1.0, 'm': 60.0, 'h': 3600.0}
+# Dưới mức này thì request kế tiếp gần như chắc bị 429, vì một call ở step sau có
+# prompt vài nghìn token. Chờ trước rẻ hơn là để 429 ăn mất một lượt thử.
+TOKEN_FLOOR = 3000
+PACE_MAX_SECONDS = 70.0
+
+
+def _parse_duration(text):
+    """'7.66s', '2m59.56s', '500ms' -> số giây. None nếu không nhận dạng được."""
+    if not text:
+        return None
+    total, found = 0.0, False
+    for value, unit in re.findall(r'(\d+(?:\.\d+)?)(ms|s|m|h)', str(text).strip().lower()):
+        total += float(value) * _DURATION_UNITS[unit]
+        found = True
+    return total if found else None
+
+
+def _retry_after_seconds(exc):
+    """Số giây provider yêu cầu chờ, chưa cắt ngọn. None nếu không có header."""
+    header = (getattr(exc, 'headers', None) or {}).get('Retry-After')
+    try:
+        return float(header)
     except (TypeError, ValueError):
-        return min(2.0 ** attempt, 32.0)
+        return _parse_duration(header)
+
+
+def _retry_delay(exc, attempt):
+    """Backoff 2^attempt, nới ra nếu provider yêu cầu chờ lâu hơn.
+
+    Phải lấy max chứ không thay thế: Groq trả Retry-After ~2s cho giới hạn
+    token/phút, nhưng bucket cần tới ~60s mới hồi. Nếu nghe theo con số nhỏ đó thì
+    cả RETRY_ATTEMPTS lần thử cháy hết trong vài giây và case mất trắng.
+    """
+    backoff = min(2.0 ** attempt, 32.0)
+    asked = _retry_after_seconds(exc)
+    return max(backoff, min(asked, 60.0)) if asked else backoff
+
+
+def _pace(headers):
+    """Chờ chủ động khi bucket token của provider gần cạn.
+
+    Không bắt buộc, nhưng không có nó thì một lần eval 22 case biến thành chuỗi 429
+    vì nhu cầu token vượt xa quota/phút của free tier.
+    """
+    try:
+        remaining = float(headers.get('x-ratelimit-remaining-tokens'))
+    except (AttributeError, TypeError, ValueError):
+        return
+    if remaining >= TOKEN_FLOOR:
+        return
+    delay = _parse_duration(headers.get('x-ratelimit-reset-tokens'))
+    if delay:
+        time.sleep(min(delay + 1.0, PACE_MAX_SECONDS))
 
 
 def post_json(url, headers, payload):
@@ -38,17 +122,33 @@ def post_json(url, headers, payload):
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             with urllib.request.urlopen(req, timeout=60) as response:
-                return json.load(response)
+                data, pace_headers = json.load(response), getattr(response, 'headers', None)
         except urllib.error.HTTPError as exc:
             # Do not print response bodies: they may contain account or request data.
+            asked = _retry_after_seconds(exc)
+            if asked and asked > RETRY_MAX_SINGLE_WAIT:
+                raise RuntimeError(f'Provider yêu cầu chờ {asked:.0f}s, quá dài để thử '
+                                   f'lại{_limit_hint(exc)}.') from exc
             delay = _retry_delay(exc, attempt)
             # Rate limit hoặc lỗi 5xx tạm thời: chờ rồi thử lại trong budget.
             if exc.code not in RETRY_CODES or attempt == RETRY_ATTEMPTS or waited + delay > RETRY_BUDGET_SECONDS:
-                raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+                raise RuntimeError(f'Provider trả HTTP {exc.code} sau {attempt} lần thử, '
+                                   f'đã chờ {waited:.0f}s{_limit_hint(exc)}.') from exc
             time.sleep(delay)
             waited += delay
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # Lỗi tầng vận chuyển (DNS chập chờn, reset, timeout) cũng là lỗi tạm thời:
+            # không retry thì một blip mạng làm mất trắng cả case trong eval.
+            delay = min(2.0 ** attempt, 32.0)
+            if attempt == RETRY_ATTEMPTS or waited + delay > RETRY_BUDGET_SECONDS:
+                reason = getattr(exc, 'reason', exc)
+                raise RuntimeError(f'Không kết nối được provider: {reason}') from exc
+            time.sleep(delay)
+            waited += delay
+        else:
+            # Pace sau khi đã đóng response, để không giữ connection trong lúc chờ.
+            _pace(pace_headers)
+            return data
 
 
 class Provider:
